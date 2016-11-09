@@ -1239,21 +1239,26 @@ void IntrinsicCodeGeneratorARM64::VisitStringEquals(HInvoke* invoke) {
   // Note that the null check must have been done earlier.
   DCHECK(!invoke->CanDoImplicitNullCheckOn(invoke->InputAt(0)));
 
-  // Check if input is null, return false if it is.
-  __ Cbz(arg, &return_false);
+  StringEqualsOptimizations optimizations(invoke);
+  if (!optimizations.GetArgumentNotNull()) {
+    // Check if input is null, return false if it is.
+    __ Cbz(arg, &return_false);
+  }
 
   // Reference equality check, return true if same reference.
   __ Cmp(str, arg);
   __ B(&return_true, eq);
 
-  // Instanceof check for the argument by comparing class fields.
-  // All string objects must have the same type since String cannot be subclassed.
-  // Receiver must be a string object, so its class field is equal to all strings' class fields.
-  // If the argument is a string object, its class field must be equal to receiver's class field.
-  __ Ldr(temp, MemOperand(str.X(), class_offset));
-  __ Ldr(temp1, MemOperand(arg.X(), class_offset));
-  __ Cmp(temp, temp1);
-  __ B(&return_false, ne);
+  if (!optimizations.GetArgumentIsString()) {
+    // Instanceof check for the argument by comparing class fields.
+    // All string objects must have the same type since String cannot be subclassed.
+    // Receiver must be a string object, so its class field is equal to all strings' class fields.
+    // If the argument is a string object, its class field must be equal to receiver's class field.
+    __ Ldr(temp, MemOperand(str.X(), class_offset));
+    __ Ldr(temp1, MemOperand(arg.X(), class_offset));
+    __ Cmp(temp, temp1);
+    __ B(&return_false, ne);
+  }
 
   // Load lengths of this and argument strings.
   __ Ldr(temp, MemOperand(str.X(), count_offset));
@@ -1302,16 +1307,16 @@ static void GenerateVisitStringIndexOf(HInvoke* invoke,
                                        ArenaAllocator* allocator,
                                        bool start_at_zero) {
   LocationSummary* locations = invoke->GetLocations();
-  Register tmp_reg = WRegisterFrom(locations->GetTemp(0));
 
   // Note that the null check must have been done earlier.
   DCHECK(!invoke->CanDoImplicitNullCheckOn(invoke->InputAt(0)));
 
   // Check for code points > 0xFFFF. Either a slow-path check when we don't know statically,
-  // or directly dispatch if we have a constant.
+  // or directly dispatch for a large constant, or omit slow-path for a small constant or a char.
   SlowPathCodeARM64* slow_path = nullptr;
-  if (invoke->InputAt(1)->IsIntConstant()) {
-    if (static_cast<uint32_t>(invoke->InputAt(1)->AsIntConstant()->GetValue()) > 0xFFFFU) {
+  HInstruction* code_point = invoke->InputAt(1);
+  if (code_point->IsIntConstant()) {
+    if (static_cast<uint32_t>(code_point->AsIntConstant()->GetValue()) > 0xFFFFU) {
       // Always needs the slow-path. We could directly dispatch to it, but this case should be
       // rare, so for simplicity just put the full slow-path down and branch unconditionally.
       slow_path = new (allocator) IntrinsicSlowPathARM64(invoke);
@@ -1320,17 +1325,17 @@ static void GenerateVisitStringIndexOf(HInvoke* invoke,
       __ Bind(slow_path->GetExitLabel());
       return;
     }
-  } else {
+  } else if (code_point->GetType() != Primitive::kPrimChar) {
     Register char_reg = WRegisterFrom(locations->InAt(1));
-    __ Mov(tmp_reg, 0xFFFF);
-    __ Cmp(char_reg, Operand(tmp_reg));
+    __ Tst(char_reg, 0xFFFF0000);
     slow_path = new (allocator) IntrinsicSlowPathARM64(invoke);
     codegen->AddSlowPath(slow_path);
-    __ B(hi, slow_path->GetEntryLabel());
+    __ B(ne, slow_path->GetEntryLabel());
   }
 
   if (start_at_zero) {
     // Start-index = 0.
+    Register tmp_reg = WRegisterFrom(locations->GetTemp(0));
     __ Mov(tmp_reg, 0);
   }
 
@@ -1354,7 +1359,7 @@ void IntrinsicLocationsBuilderARM64::VisitStringIndexOf(HInvoke* invoke) {
   locations->SetInAt(1, LocationFrom(calling_convention.GetRegisterAt(1)));
   locations->SetOut(calling_convention.GetReturnLocation(Primitive::kPrimInt));
 
-  // Need a temp for slow-path codepoint compare, and need to send start_index=0.
+  // Need to send start_index=0.
   locations->AddTemp(LocationFrom(calling_convention.GetRegisterAt(2)));
 }
 
@@ -1374,9 +1379,6 @@ void IntrinsicLocationsBuilderARM64::VisitStringIndexOfAfter(HInvoke* invoke) {
   locations->SetInAt(1, LocationFrom(calling_convention.GetRegisterAt(1)));
   locations->SetInAt(2, LocationFrom(calling_convention.GetRegisterAt(2)));
   locations->SetOut(calling_convention.GetReturnLocation(Primitive::kPrimInt));
-
-  // Need a temp for slow-path codepoint compare.
-  locations->AddTemp(Location::RequiresRegister());
 }
 
 void IntrinsicCodeGeneratorARM64::VisitStringIndexOfAfter(HInvoke* invoke) {
@@ -2201,9 +2203,46 @@ void IntrinsicCodeGeneratorARM64::VisitSystemArrayCopy(HInvoke* invoke) {
   __ Bind(slow_path->GetExitLabel());
 }
 
+static void GenIsInfinite(LocationSummary* locations,
+                          bool is64bit,
+                          vixl::MacroAssembler* masm) {
+  Operand infinity;
+  Register out;
+
+  if (is64bit) {
+    infinity = kPositiveInfinityDouble;
+    out = XRegisterFrom(locations->Out());
+  } else {
+    infinity = kPositiveInfinityFloat;
+    out = WRegisterFrom(locations->Out());
+  }
+
+  const Register zero = vixl::Assembler::AppropriateZeroRegFor(out);
+
+  MoveFPToInt(locations, is64bit, masm);
+  __ Eor(out, out, infinity);
+  // We don't care about the sign bit, so shift left.
+  __ Cmp(zero, Operand(out, LSL, 1));
+  __ Cset(out, eq);
+}
+
+void IntrinsicLocationsBuilderARM64::VisitFloatIsInfinite(HInvoke* invoke) {
+  CreateFPToIntLocations(arena_, invoke);
+}
+
+void IntrinsicCodeGeneratorARM64::VisitFloatIsInfinite(HInvoke* invoke) {
+  GenIsInfinite(invoke->GetLocations(), /* is64bit */ false, GetVIXLAssembler());
+}
+
+void IntrinsicLocationsBuilderARM64::VisitDoubleIsInfinite(HInvoke* invoke) {
+  CreateFPToIntLocations(arena_, invoke);
+}
+
+void IntrinsicCodeGeneratorARM64::VisitDoubleIsInfinite(HInvoke* invoke) {
+  GenIsInfinite(invoke->GetLocations(), /* is64bit */ true, GetVIXLAssembler());
+}
+
 UNIMPLEMENTED_INTRINSIC(ARM64, ReferenceGetReferent)
-UNIMPLEMENTED_INTRINSIC(ARM64, FloatIsInfinite)
-UNIMPLEMENTED_INTRINSIC(ARM64, DoubleIsInfinite)
 UNIMPLEMENTED_INTRINSIC(ARM64, IntegerHighestOneBit)
 UNIMPLEMENTED_INTRINSIC(ARM64, LongHighestOneBit)
 UNIMPLEMENTED_INTRINSIC(ARM64, IntegerLowestOneBit)

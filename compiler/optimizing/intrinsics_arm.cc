@@ -1055,17 +1055,22 @@ void IntrinsicCodeGeneratorARM::VisitStringEquals(HInvoke* invoke) {
   // Note that the null check must have been done earlier.
   DCHECK(!invoke->CanDoImplicitNullCheckOn(invoke->InputAt(0)));
 
-  // Check if input is null, return false if it is.
-  __ CompareAndBranchIfZero(arg, &return_false);
+  StringEqualsOptimizations optimizations(invoke);
+  if (!optimizations.GetArgumentNotNull()) {
+    // Check if input is null, return false if it is.
+    __ CompareAndBranchIfZero(arg, &return_false);
+  }
 
-  // Instanceof check for the argument by comparing class fields.
-  // All string objects must have the same type since String cannot be subclassed.
-  // Receiver must be a string object, so its class field is equal to all strings' class fields.
-  // If the argument is a string object, its class field must be equal to receiver's class field.
-  __ ldr(temp, Address(str, class_offset));
-  __ ldr(temp1, Address(arg, class_offset));
-  __ cmp(temp, ShifterOperand(temp1));
-  __ b(&return_false, NE);
+  if (!optimizations.GetArgumentIsString()) {
+    // Instanceof check for the argument by comparing class fields.
+    // All string objects must have the same type since String cannot be subclassed.
+    // Receiver must be a string object, so its class field is equal to all strings' class fields.
+    // If the argument is a string object, its class field must be equal to receiver's class field.
+    __ ldr(temp, Address(str, class_offset));
+    __ ldr(temp1, Address(arg, class_offset));
+    __ cmp(temp, ShifterOperand(temp1));
+    __ b(&return_false, NE);
+  }
 
   // Load lengths of this and argument strings.
   __ ldr(temp, Address(str, count_offset));
@@ -1115,16 +1120,16 @@ static void GenerateVisitStringIndexOf(HInvoke* invoke,
                                        ArenaAllocator* allocator,
                                        bool start_at_zero) {
   LocationSummary* locations = invoke->GetLocations();
-  Register tmp_reg = locations->GetTemp(0).AsRegister<Register>();
 
   // Note that the null check must have been done earlier.
   DCHECK(!invoke->CanDoImplicitNullCheckOn(invoke->InputAt(0)));
 
   // Check for code points > 0xFFFF. Either a slow-path check when we don't know statically,
-  // or directly dispatch if we have a constant.
+  // or directly dispatch for a large constant, or omit slow-path for a small constant or a char.
   SlowPathCode* slow_path = nullptr;
-  if (invoke->InputAt(1)->IsIntConstant()) {
-    if (static_cast<uint32_t>(invoke->InputAt(1)->AsIntConstant()->GetValue()) >
+  HInstruction* code_point = invoke->InputAt(1);
+  if (code_point->IsIntConstant()) {
+    if (static_cast<uint32_t>(code_point->AsIntConstant()->GetValue()) >
         std::numeric_limits<uint16_t>::max()) {
       // Always needs the slow-path. We could directly dispatch to it, but this case should be
       // rare, so for simplicity just put the full slow-path down and branch unconditionally.
@@ -1134,16 +1139,18 @@ static void GenerateVisitStringIndexOf(HInvoke* invoke,
       __ Bind(slow_path->GetExitLabel());
       return;
     }
-  } else {
+  } else if (code_point->GetType() != Primitive::kPrimChar) {
     Register char_reg = locations->InAt(1).AsRegister<Register>();
-    __ LoadImmediate(tmp_reg, std::numeric_limits<uint16_t>::max());
-    __ cmp(char_reg, ShifterOperand(tmp_reg));
+    // 0xffff is not modified immediate but 0x10000 is, so use `>= 0x10000` instead of `> 0xffff`.
+    __ cmp(char_reg,
+           ShifterOperand(static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) + 1));
     slow_path = new (allocator) IntrinsicSlowPathARM(invoke);
     codegen->AddSlowPath(slow_path);
-    __ b(slow_path->GetEntryLabel(), HI);
+    __ b(slow_path->GetEntryLabel(), HS);
   }
 
   if (start_at_zero) {
+    Register tmp_reg = locations->GetTemp(0).AsRegister<Register>();
     DCHECK_EQ(tmp_reg, R2);
     // Start-index = 0.
     __ LoadImmediate(tmp_reg, 0);
@@ -1170,7 +1177,7 @@ void IntrinsicLocationsBuilderARM::VisitStringIndexOf(HInvoke* invoke) {
   locations->SetInAt(1, Location::RegisterLocation(calling_convention.GetRegisterAt(1)));
   locations->SetOut(Location::RegisterLocation(R0));
 
-  // Need a temp for slow-path codepoint compare, and need to send start-index=0.
+  // Need to send start-index=0.
   locations->AddTemp(Location::RegisterLocation(calling_convention.GetRegisterAt(2)));
 }
 
@@ -1190,9 +1197,6 @@ void IntrinsicLocationsBuilderARM::VisitStringIndexOfAfter(HInvoke* invoke) {
   locations->SetInAt(1, Location::RegisterLocation(calling_convention.GetRegisterAt(1)));
   locations->SetInAt(2, Location::RegisterLocation(calling_convention.GetRegisterAt(2)));
   locations->SetOut(Location::RegisterLocation(R0));
-
-  // Need a temp for slow-path codepoint compare.
-  locations->AddTemp(Location::RequiresRegister());
 }
 
 void IntrinsicCodeGeneratorARM::VisitStringIndexOfAfter(HInvoke* invoke) {
@@ -1932,7 +1936,7 @@ void IntrinsicLocationsBuilderARM::VisitStringGetCharsNoCheck(HInvoke* invoke) {
   locations->SetInAt(3, Location::RequiresRegister());
   locations->SetInAt(4, Location::RequiresRegister());
 
-  locations->AddTemp(Location::RequiresRegister());
+  // Temporary registers to store lengths of strings and for calculations.
   locations->AddTemp(Location::RequiresRegister());
   locations->AddTemp(Location::RequiresRegister());
   locations->AddTemp(Location::RequiresRegister());
@@ -1960,29 +1964,106 @@ void IntrinsicCodeGeneratorARM::VisitStringGetCharsNoCheck(HInvoke* invoke) {
   Register dstObj = locations->InAt(3).AsRegister<Register>();
   Register dstBegin = locations->InAt(4).AsRegister<Register>();
 
-  Register src_ptr = locations->GetTemp(0).AsRegister<Register>();
-  Register src_ptr_end = locations->GetTemp(1).AsRegister<Register>();
+  Register num_chr = locations->GetTemp(0).AsRegister<Register>();
+  Register src_ptr = locations->GetTemp(1).AsRegister<Register>();
   Register dst_ptr = locations->GetTemp(2).AsRegister<Register>();
-  Register tmp = locations->GetTemp(3).AsRegister<Register>();
 
   // src range to copy.
   __ add(src_ptr, srcObj, ShifterOperand(value_offset));
-  __ add(src_ptr_end, src_ptr, ShifterOperand(srcEnd, LSL, 1));
   __ add(src_ptr, src_ptr, ShifterOperand(srcBegin, LSL, 1));
 
   // dst to be copied.
   __ add(dst_ptr, dstObj, ShifterOperand(data_offset));
   __ add(dst_ptr, dst_ptr, ShifterOperand(dstBegin, LSL, 1));
 
+  __ subs(num_chr, srcEnd, ShifterOperand(srcBegin));
+
   // Do the copy.
-  Label loop, done;
-  __ Bind(&loop);
-  __ cmp(src_ptr, ShifterOperand(src_ptr_end));
+  Label loop, remainder, done;
+
+  // Early out for valid zero-length retrievals.
   __ b(&done, EQ);
-  __ ldrh(tmp, Address(src_ptr, char_size, Address::PostIndex));
-  __ strh(tmp, Address(dst_ptr, char_size, Address::PostIndex));
-  __ b(&loop);
+
+  // Save repairing the value of num_chr on the < 4 character path.
+  __ subs(IP, num_chr, ShifterOperand(4));
+  __ b(&remainder, LT);
+
+  // Keep the result of the earlier subs, we are going to fetch at least 4 characters.
+  __ mov(num_chr, ShifterOperand(IP));
+
+  // Main loop used for longer fetches loads and stores 4x16-bit characters at a time.
+  // (LDRD/STRD fault on unaligned addresses and it's not worth inlining extra code
+  // to rectify these everywhere this intrinsic applies.)
+  __ Bind(&loop);
+  __ ldr(IP, Address(src_ptr, char_size * 2));
+  __ subs(num_chr, num_chr, ShifterOperand(4));
+  __ str(IP, Address(dst_ptr, char_size * 2));
+  __ ldr(IP, Address(src_ptr, char_size * 4, Address::PostIndex));
+  __ str(IP, Address(dst_ptr, char_size * 4, Address::PostIndex));
+  __ b(&loop, GE);
+
+  __ adds(num_chr, num_chr, ShifterOperand(4));
+  __ b(&done, EQ);
+
+  // Main loop for < 4 character case and remainder handling. Loads and stores one
+  // 16-bit Java character at a time.
+  __ Bind(&remainder);
+  __ ldrh(IP, Address(src_ptr, char_size, Address::PostIndex));
+  __ subs(num_chr, num_chr, ShifterOperand(1));
+  __ strh(IP, Address(dst_ptr, char_size, Address::PostIndex));
+  __ b(&remainder, GT);
+
   __ Bind(&done);
+}
+
+void IntrinsicLocationsBuilderARM::VisitFloatIsInfinite(HInvoke* invoke) {
+  CreateFPToIntLocations(arena_, invoke);
+}
+
+void IntrinsicCodeGeneratorARM::VisitFloatIsInfinite(HInvoke* invoke) {
+  ArmAssembler* const assembler = GetAssembler();
+  LocationSummary* const locations = invoke->GetLocations();
+  const Register out = locations->Out().AsRegister<Register>();
+  // Shifting left by 1 bit makes the value encodable as an immediate operand;
+  // we don't care about the sign bit anyway.
+  constexpr uint32_t infinity = kPositiveInfinityFloat << 1U;
+
+  __ vmovrs(out, locations->InAt(0).AsFpuRegister<SRegister>());
+  // We don't care about the sign bit, so shift left.
+  __ Lsl(out, out, 1);
+  __ eor(out, out, ShifterOperand(infinity));
+  // If the result is 0, then it has 32 leading zeros, and less than that otherwise.
+  __ clz(out, out);
+  // Any number less than 32 logically shifted right by 5 bits results in 0;
+  // the same operation on 32 yields 1.
+  __ Lsr(out, out, 5);
+}
+
+void IntrinsicLocationsBuilderARM::VisitDoubleIsInfinite(HInvoke* invoke) {
+  CreateFPToIntLocations(arena_, invoke);
+}
+
+void IntrinsicCodeGeneratorARM::VisitDoubleIsInfinite(HInvoke* invoke) {
+  ArmAssembler* const assembler = GetAssembler();
+  LocationSummary* const locations = invoke->GetLocations();
+  const Register out = locations->Out().AsRegister<Register>();
+  // The highest 32 bits of double precision positive infinity separated into
+  // two constants encodable as immediate operands.
+  constexpr uint32_t infinity_high  = 0x7f000000U;
+  constexpr uint32_t infinity_high2 = 0x00f00000U;
+
+  static_assert((infinity_high | infinity_high2) == static_cast<uint32_t>(kPositiveInfinityDouble >> 32U),
+                "The constants do not add up to the high 32 bits of double precision positive infinity.");
+  __ vmovrrd(IP, out, FromLowSToD(locations->InAt(0).AsFpuRegisterPairLow<SRegister>()));
+  __ eor(out, out, ShifterOperand(infinity_high));
+  __ eor(out, out, ShifterOperand(infinity_high2));
+  // We don't care about the sign bit, so shift left.
+  __ orr(out, IP, ShifterOperand(out, LSL, 1));
+  // If the result is 0, then it has 32 leading zeros, and less than that otherwise.
+  __ clz(out, out);
+  // Any number less than 32 logically shifted right by 5 bits results in 0;
+  // the same operation on 32 yields 1.
+  __ Lsr(out, out, 5);
 }
 
 UNIMPLEMENTED_INTRINSIC(ARM, IntegerBitCount)
@@ -2001,8 +2082,6 @@ UNIMPLEMENTED_INTRINSIC(ARM, MathRoundFloat)    // Could be done by changing rou
 UNIMPLEMENTED_INTRINSIC(ARM, UnsafeCASLong)     // High register pressure.
 UNIMPLEMENTED_INTRINSIC(ARM, SystemArrayCopyChar)
 UNIMPLEMENTED_INTRINSIC(ARM, ReferenceGetReferent)
-UNIMPLEMENTED_INTRINSIC(ARM, FloatIsInfinite)
-UNIMPLEMENTED_INTRINSIC(ARM, DoubleIsInfinite)
 UNIMPLEMENTED_INTRINSIC(ARM, IntegerHighestOneBit)
 UNIMPLEMENTED_INTRINSIC(ARM, LongHighestOneBit)
 UNIMPLEMENTED_INTRINSIC(ARM, IntegerLowestOneBit)

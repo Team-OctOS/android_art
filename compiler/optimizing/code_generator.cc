@@ -277,7 +277,8 @@ void CodeGenerator::InitializeCodeGeneration(size_t number_of_spill_slots,
   DCHECK(!block_order.empty());
   DCHECK(block_order[0] == GetGraph()->GetEntryBlock());
   ComputeSpillMask();
-  first_register_slot_in_slow_path_ = (number_of_out_slots + number_of_spill_slots) * kVRegSize;
+  first_register_slot_in_slow_path_ = RoundUp(
+      (number_of_out_slots + number_of_spill_slots) * kVRegSize, GetPreferredSlotsAlignment());
 
   if (number_of_spill_slots == 0
       && !HasAllocatedCalleeSaveRegisters()
@@ -287,9 +288,17 @@ void CodeGenerator::InitializeCodeGeneration(size_t number_of_spill_slots,
     DCHECK_EQ(maximum_number_of_live_fpu_registers, 0u);
     SetFrameSize(CallPushesPC() ? GetWordSize() : 0);
   } else {
+#ifdef ART_ENABLE_CODEGEN_arm64
+    if (GetInstructionSet() == kArm64) {
+      // Adjust the offset to which we spill and restore registers for slow
+      // paths. We want to use the STP and LDP instructions, which can only
+      // encode offsets that are multiples of the register size accessed.
+      first_register_slot_in_slow_path_ =
+          RoundUp(first_register_slot_in_slow_path_, vixl::kXRegSizeInBytes);
+    }
+#endif
     SetFrameSize(RoundUp(
-        number_of_spill_slots * kVRegSize
-        + number_of_out_slots * kVRegSize
+        first_register_slot_in_slow_path_
         + maximum_number_of_live_core_registers * GetWordSize()
         + maximum_number_of_live_fpu_registers * GetFloatingPointSpillSlotSize()
         + FrameEntrySpillSize(),
@@ -865,7 +874,7 @@ void CodeGenerator::RecordCatchBlockInfo() {
     }
 
       if (current_phi == nullptr || current_phi->AsPhi()->GetRegNumber() != vreg) {
-        stack_map_stream_.AddDexRegisterEntry(DexRegisterLocation::Kind::kNone, 0);
+        stack_map_stream_.NextDexRegisterEntry();
       } else {
         Location location = current_phi->GetLiveInterval()->ToLocation();
         switch (location.GetKind()) {
@@ -912,7 +921,7 @@ void CodeGenerator::EmitEnvironment(HEnvironment* environment, SlowPathCode* slo
   for (size_t i = 0, environment_size = environment->Size(); i < environment_size; ++i) {
     HInstruction* current = environment->GetInstructionAt(i);
     if (current == nullptr) {
-      stack_map_stream_.AddDexRegisterEntry(DexRegisterLocation::Kind::kNone, 0);
+      stack_map_stream_.NextDexRegisterEntry();
       continue;
     }
 
@@ -1052,7 +1061,7 @@ void CodeGenerator::EmitEnvironment(HEnvironment* environment, SlowPathCode* slo
       }
 
       case Location::kInvalid: {
-        stack_map_stream_.AddDexRegisterEntry(DexRegisterLocation::Kind::kNone, 0);
+        stack_map_stream_.NextDexRegisterEntry();
         break;
       }
 
